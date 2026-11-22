@@ -111,6 +111,7 @@ def phone() -> FakeSource:
 
 def opts(**kw: object) -> BackupOptions:
     gate = GateOptions(seed=1)
+    kw.setdefault("retry_delays", (0.0, 0.0))  # keep retries instant in tests
     return BackupOptions(gate=gate, now=kw.pop("now", NOW), **kw)  # type: ignore[arg-type]
 
 

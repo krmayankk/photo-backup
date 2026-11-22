@@ -16,7 +16,7 @@ def test_copy_returns_hash_and_preserves_mtime(tmp_path: Path) -> None:
     assert dest.read_bytes() == data
     assert (sha, size) == (hashlib.sha256(data).hexdigest(), len(data))
     assert int(dest.stat().st_mtime) == 1_600_000_000
-    assert not list(tmp_path.rglob("*.partial"))
+    assert not list(tmp_path.rglob(".pbtmp-*"))
 
 
 def test_never_overwrites(tmp_path: Path) -> None:
@@ -52,10 +52,22 @@ def test_source_error_mid_copy_leaves_nothing(tmp_path: Path) -> None:
     assert list(tmp_path.iterdir()) == []
 
 
-def test_remove_stale_partials(tmp_path: Path) -> None:
+def test_remove_stale_partials_spares_real_files(tmp_path: Path) -> None:
     (tmp_path / "a").mkdir()
-    (tmp_path / "a" / "IMG.HEIC.partial").write_bytes(b"x")
+    (tmp_path / "a" / ".pbtmp-IMG.HEIC").write_bytes(b"x")  # leftover temp
     (tmp_path / "a" / "IMG.HEIC").write_bytes(b"keep")
-    assert remove_stale_partials(tmp_path) == 1
-    assert [p.name for p in (tmp_path / "a").iterdir()] == ["IMG.HEIC"]
+    (tmp_path / "a" / "movie.mp4.partial").write_bytes(b"a real backed-up file")
+    known = tmp_path / "a" / ".pbtmp-backed-up-for-real"
+    known.write_bytes(b"cataloged")
+    assert remove_stale_partials(tmp_path, keep={known}) == 1
+    names = sorted(p.name for p in (tmp_path / "a").iterdir())
+    assert names == [".pbtmp-backed-up-for-real", "IMG.HEIC", "movie.mp4.partial"]
     assert remove_stale_partials(tmp_path / "missing") == 0
+
+
+def test_existing_temp_file_is_never_truncated(tmp_path: Path) -> None:
+    (tmp_path / ".pbtmp-IMG.HEIC").write_bytes(b"precious")
+    with pytest.raises(CopyError, match="temp file already exists"):
+        copy_verified(io.BytesIO(b"new"), tmp_path / "IMG.HEIC", expected_size=3, mtime=None)
+    assert (tmp_path / ".pbtmp-IMG.HEIC").read_bytes() == b"precious"
+    assert not (tmp_path / "IMG.HEIC").exists()

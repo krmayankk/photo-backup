@@ -20,8 +20,16 @@ from photo_backup.drive import (
 )
 from photo_backup.fsutil import fs_type
 from photo_backup.health import GateOptions, read_history, run_gate
-from photo_backup.report import EXIT_GATE_FAILED, EXIT_OK, EXIT_USAGE, human_bytes, table
+from photo_backup.report import (
+    EXIT_GATE_FAILED,
+    EXIT_OK,
+    EXIT_USAGE,
+    EXIT_VERIFY_FAILED,
+    human_bytes,
+    table,
+)
 from photo_backup.sources import SourceError, open_source
+from photo_backup.state import forget_drive
 from photo_backup.status import run_status
 from photo_backup.verify import run_verify
 
@@ -79,6 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--skip-trash", action="store_true", help="dir: skip .Trashes folders")
     p.add_argument("--dry-run", action="store_true", help="plan and gate only, copy nothing")
     p.add_argument("--limit", type=int, help="copy at most N new files (smoke tests)")
+    p.add_argument("--no-progress", action="store_true", help="no live progress bar")
     _add_gate_flags(p)
 
     p = sub.add_parser("verify", help="re-hash backed-up files against the catalog")
@@ -86,6 +95,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--device")
     p.add_argument("--month", help="YYYY-MM")
     p.add_argument("--sample-pct", type=float, help="verify a random percentage only")
+    p.add_argument("--no-progress", action="store_true", help="no live progress bar")
+
+    p = sub.add_parser("forget", help="stop counting a lost or wiped drive in status")
+    p.add_argument("label")
 
     p = sub.add_parser("status", help="what is safe to delete from the phone")
     p.add_argument("--device")
@@ -148,7 +161,12 @@ def _cmd_health(args: argparse.Namespace) -> int:
 
 def _cmd_backup(args: argparse.Namespace) -> int:
     drive = resolve_drive(args.drive)
-    opts = BackupOptions(dry_run=args.dry_run, limit=args.limit, gate=_gate_opts(args))
+    opts = BackupOptions(
+        dry_run=args.dry_run,
+        limit=args.limit,
+        gate=_gate_opts(args),
+        live_progress=not args.no_progress,
+    )
     source = open_source(args.source, name=args.name, udid=args.udid, skip_trash=args.skip_trash)
     with source:
         return run_backup(source, drive, opts, disk=block_device(drive.mount))
@@ -156,7 +174,19 @@ def _cmd_backup(args: argparse.Namespace) -> int:
 
 def _cmd_verify(args: argparse.Namespace) -> int:
     drive = resolve_drive(args.drive)
-    return run_verify(drive, device=args.device, month=args.month, sample_pct=args.sample_pct)
+    return run_verify(
+        drive,
+        device=args.device,
+        month=args.month,
+        sample_pct=args.sample_pct,
+        live_progress=not args.no_progress,
+    )
+
+
+def _cmd_forget(args: argparse.Namespace) -> int:
+    n = forget_drive(args.label)
+    print(f"forgot {n} record(s) for {args.label}" if n else f"no records for {args.label}")
+    return EXIT_OK
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
@@ -169,6 +199,7 @@ _COMMANDS = {
     "health": _cmd_health,
     "backup": _cmd_backup,
     "verify": _cmd_verify,
+    "forget": _cmd_forget,
     "status": _cmd_status,
 }
 
@@ -180,6 +211,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (DriveError, SourceError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_USAGE
+    except OSError as exc:  # e.g. drive unplugged mid-run, read-only mount
+        print(
+            f"I/O error: {exc}\nverified files are kept; fix the cause and re-run", file=sys.stderr
+        )
+        return EXIT_VERIFY_FAILED
     except KeyboardInterrupt:
         print("\ninterrupted: verified files are kept; re-run to resume", file=sys.stderr)
         return 130

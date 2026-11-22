@@ -130,14 +130,15 @@ def test_space_check_requires_margin(drive: Drive) -> None:
 def test_spot_check_detects_damage(drive: Drive, phone) -> None:
     assert backup(phone, drive)[0] == 0
     with drive.open_catalog() as cat:
-        check, _ = sample_check(drive, cat, 100, 10**12, random.Random(0))
+        check, _, _ = sample_check(drive, cat, 100, 10**12, random.Random(0))
         assert check.level is Level.OK
         victim = next(cat.files())
         path: Path = drive.root / victim.dest_path
         path.write_bytes(b"bit rot" + path.read_bytes()[7:])
-        check, metrics = sample_check(drive, cat, 100, 10**12, random.Random(0))
+        check, metrics, damaged = sample_check(drive, cat, 100, 10**12, random.Random(0))
     assert check.level is Level.FAIL
     assert metrics["sample_bad"] == 1
+    assert [r.dest_path for r in damaged] == [victim.dest_path]
 
 
 def test_speed_check_warns_when_much_slower() -> None:

@@ -2,14 +2,19 @@
 
 The catalog is an index for speed. The plain-text ``manifest.tsv`` files in each run
 folder hold the same information and remain readable without this tool.
+
+``verified_at`` is the single source of truth for "this drive holds a good copy":
+it is set when a file is copied (verify-on-write) or re-verified, and cleared to NULL
+when ``verify`` or the gate's spot-check finds the copy damaged or missing. Rows with a
+NULL ``verified_at`` are neither counted by ``status`` nor skipped by ``backup``.
 """
 
 from __future__ import annotations
 
 import os
 import sqlite3
-from collections.abc import Iterator
-from dataclasses import dataclass
+from collections.abc import Iterable, Iterator
+from dataclasses import astuple, dataclass, fields
 from pathlib import Path
 
 from photo_backup.model import SourceFile
@@ -26,10 +31,19 @@ CREATE TABLE IF NOT EXISTS files (
     month       TEXT    NOT NULL,   -- YYYY-MM run folder
     run_id      TEXT    NOT NULL,
     copied_at   TEXT    NOT NULL,
-    verified_at TEXT,
+    verified_at TEXT,               -- NULL = copy known damaged/missing
     PRIMARY KEY (device, src_path, size, mtime)
 );
 CREATE INDEX IF NOT EXISTS files_by_month ON files (device, month);
+-- Size + SHA-256 of each append-only record file (manifest.tsv, SHA256SUMS) as of the
+-- end of the last run that touched it. Later runs check the file still starts with
+-- exactly these bytes, which proves nothing was modified in place.
+CREATE TABLE IF NOT EXISTS records (
+    path     TEXT PRIMARY KEY,      -- relative to <drive>/PhotoBackup
+    size     INTEGER NOT NULL,
+    sha256   TEXT    NOT NULL,
+    run_id   TEXT    NOT NULL
+);
 CREATE TABLE IF NOT EXISTS runs (
     run_id   TEXT PRIMARY KEY,
     device   TEXT NOT NULL,
@@ -55,6 +69,10 @@ class FileRow:
     copied_at: str
     verified_at: str | None
 
+    @property
+    def is_good(self) -> bool:
+        return self.verified_at is not None
+
 
 @dataclass(frozen=True)
 class RunRow:
@@ -64,6 +82,16 @@ class RunRow:
     started: str
     finished: str | None
     result: str | None
+
+
+# Columns are always named explicitly so the dataclasses never depend on table order.
+_FILE_COLS = ", ".join(f.name for f in fields(FileRow))
+_RUN_COLS = ", ".join(f.name for f in fields(RunRow))
+_KEY = "device=? AND src_path=? AND size=? AND mtime=?"
+
+
+def _key(row: FileRow) -> tuple[str, str, int, int]:
+    return (row.device, row.src_path, row.size, row.mtime)
 
 
 class Catalog:
@@ -87,33 +115,25 @@ class Catalog:
 
     def get(self, device: str, f: SourceFile) -> FileRow | None:
         cur = self._db.execute(
-            "SELECT * FROM files WHERE device=? AND src_path=? AND size=? AND mtime=?",
-            (device, f.path, f.size, f.mtime),
+            f"SELECT {_FILE_COLS} FROM files WHERE {_KEY}", (device, f.path, f.size, f.mtime)
         )
         row = cur.fetchone()
         return FileRow(*row) if row else None
 
-    def add(self, row: FileRow) -> None:
+    def put(self, row: FileRow) -> None:
+        """Insert a row, replacing an existing row for the same source file.
+
+        Replacing is only ever done for a row whose copy was found damaged (the backup
+        planner never re-copies a file that has a good row).
+        """
+        placeholders = ",".join("?" * len(fields(FileRow)))
         self._db.execute(
-            "INSERT INTO files VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                row.device,
-                row.src_path,
-                row.size,
-                row.mtime,
-                row.sha256,
-                row.kind,
-                row.dest_path,
-                row.month,
-                row.run_id,
-                row.copied_at,
-                row.verified_at,
-            ),
+            f"INSERT OR REPLACE INTO files ({_FILE_COLS}) VALUES ({placeholders})", astuple(row)
         )
         self._db.commit()
 
     def files(self, device: str | None = None, month: str | None = None) -> Iterator[FileRow]:
-        sql = "SELECT * FROM files"
+        sql = f"SELECT {_FILE_COLS} FROM files"
         clauses, args = [], []
         if device:
             clauses.append("device=?")
@@ -127,15 +147,40 @@ class Catalog:
         for row in self._db.execute(sql, args):
             yield FileRow(*row)
 
+    def dest_paths(self) -> set[str]:
+        return {r[0] for r in self._db.execute("SELECT dest_path FROM files")}
+
     def count(self) -> int:
         return int(self._db.execute("SELECT COUNT(*) FROM files").fetchone()[0])
 
-    def mark_verified(self, rows: list[FileRow], when: str) -> None:
+    def mark_verified(self, rows: Iterable[FileRow], when: str) -> None:
         self._db.executemany(
-            "UPDATE files SET verified_at=? WHERE device=? AND src_path=? AND size=? AND mtime=?",
-            [(when, r.device, r.src_path, r.size, r.mtime) for r in rows],
+            f"UPDATE files SET verified_at=? WHERE {_KEY}", [(when, *_key(r)) for r in rows]
         )
         self._db.commit()
+
+    def mark_damaged(self, rows: Iterable[FileRow]) -> None:
+        """Forget that these copies are good; status stops counting them, backup re-copies."""
+        self._db.executemany(
+            f"UPDATE files SET verified_at=NULL WHERE {_KEY}", [_key(r) for r in rows]
+        )
+        self._db.commit()
+
+    # -- append-only record files ---------------------------------------------------
+
+    def set_record(self, path: str, size: int, sha256: str, run_id: str) -> None:
+        self._db.execute(
+            "INSERT OR REPLACE INTO records (path, size, sha256, run_id) VALUES (?,?,?,?)",
+            (path, size, sha256, run_id),
+        )
+        self._db.commit()
+
+    def records(self) -> list[tuple[str, int, str]]:
+        """``(path, size, sha256)`` for every append-only record file."""
+        return [
+            (p, int(n), h)
+            for p, n, h in self._db.execute("SELECT path, size, sha256 FROM records ORDER BY path")
+        ]
 
     # -- runs ------------------------------------------------------------------------
 
@@ -165,7 +210,7 @@ class Catalog:
         self._db.commit()
 
     def runs(self, device: str | None = None) -> list[RunRow]:
-        sql = "SELECT run_id, device, month, started, finished, result FROM runs"
+        sql = f"SELECT {_RUN_COLS} FROM runs"
         args: tuple[str, ...] = ()
         if device:
             sql += " WHERE device=?"

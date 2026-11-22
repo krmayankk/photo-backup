@@ -13,7 +13,9 @@ Steps (each must pass):
   4. backup again -> copies 0 files
   5. `sha256sum -c SHA256SUMS` (independent of this tool)
   6. byte-for-byte compare every source file with its copy
-  7. corruption drill: damage one copy -> verify must FAIL; restore -> verify PASS
+  7. status (1 copy required) -> SAFE TO DELETE
+  8. corruption drill: damage one copy -> verify FAIL and status NOT YET;
+     restore -> verify PASS and status SAFE again
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ from photo_backup.backup import BackupOptions, run_backup
 from photo_backup.drive import block_device, init_drive
 from photo_backup.health import GateOptions
 from photo_backup.sources.directory import DirectorySource
+from photo_backup.status import run_status
 from photo_backup.verify import run_verify
 
 DEVICE = "itest-camera"
@@ -132,14 +135,24 @@ def main() -> int:
             ]
             step(f"byte-for-byte compare of {len(rows)} files", not mismatched)
 
+            def status_text() -> str:
+                lines: list[str] = []
+                run_status(device=DEVICE, min_copies=1, out=lines.append)
+                return "\n".join(lines)
+
+            step("status says SAFE TO DELETE", "SAFE TO DELETE" in status_text())
+
             victim = month_dir / "files" / rows[0]["dest_path"]
             original = victim.read_bytes()
             victim.write_bytes(bytes([original[0] ^ 0xFF]) + original[1:])
             detected = run_verify(drive) == 1
+            blocked = "NOT YET" in status_text()
             victim.write_bytes(original)
+            # The damaged copy stays NOT YET until verified good again.
+            recovered = run_verify(drive) == 0 and "SAFE TO DELETE" in status_text()
             step(
-                "corruption drill (damage detected, then clean)",
-                detected and run_verify(drive) == 0,
+                "corruption drill (verify FAIL + status NOT YET, then recovers)",
+                detected and blocked and recovered,
             )
         finally:
             if args.keep:

@@ -111,19 +111,19 @@ def test_limit_defers_the_rest(drive: Drive, phone: FakeSource) -> None:
 def test_resume_after_crash_between_copy_and_catalog(
     drive: Drive, phone: FakeSource, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    real_add = Catalog.add
+    real_put = Catalog.put
     calls = {"n": 0}
 
-    def crashing_add(self: Catalog, row: object) -> None:
+    def crashing_put(self: Catalog, row: object) -> None:
         calls["n"] += 1
         if calls["n"] == 3:
             raise KeyboardInterrupt  # simulates power loss after the file landed
-        real_add(self, row)  # type: ignore[arg-type]
+        real_put(self, row)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(Catalog, "add", crashing_add)
+    monkeypatch.setattr(Catalog, "put", crashing_put)
     with pytest.raises(KeyboardInterrupt):
         backup(phone, drive)
-    monkeypatch.setattr(Catalog, "add", real_add)
+    monkeypatch.setattr(Catalog, "put", real_put)
 
     code, _ = backup(phone, drive)
     assert code == EXIT_OK
@@ -132,7 +132,7 @@ def test_resume_after_crash_between_copy_and_catalog(
     assert sum(c["conflicts"] for c in counts.values()) == 0
     landed = [p for p in (run_dir(drive) / "files").rglob("*") if p.is_file()]
     assert len(landed) == len(phone_files())
-    assert not [p for p in landed if "conflict" in p.name or p.suffix == ".partial"]
+    assert not [p for p in landed if "conflict" in p.name or p.name.startswith(".pbtmp-")]
 
 
 def test_different_bytes_at_same_path_are_kept_side_by_side(
