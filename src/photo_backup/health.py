@@ -38,6 +38,13 @@ FREE_MARGIN = 1.1
 
 SMARTCTL_HINT = "install smartmontools and allow passwordless smartctl (see README, 'Drive health')"
 
+_KERNEL_BLOCKS_SAT = "unsupported field in scsi command"
+UAS_BLOCKED_HINT = (
+    "SMART blocked by the Linux uas driver for this USB enclosure (NO_ATA_1X quirk, applied "
+    "to all Seagate enclosures). To read SMART, disable UAS for this device: "
+    "usb-storage quirk VID:PID:u (see docs/reviews/2026-11-22-seagate-usb-disconnect.md)"
+)
+
 _KERNEL_ERROR_RE = re.compile(
     r"I/O error|Medium Error|Unrecovered read error|critical medium error|Buffer I/O error"
     r"|device offline error|DID_NO_CONNECT",
@@ -167,6 +174,10 @@ def smart_checks(
             return [Check("smart", unknown, f"smartctl not installed; {SMARTCTL_HINT}")], {}
         if "password is required" in p.stderr or "terminal is required" in p.stderr:
             return [Check("smart", unknown, f"no sudo rule for smartctl; {SMARTCTL_HINT}")], {}
+        if _KERNEL_BLOCKS_SAT in (p.stdout + p.stderr).lower():
+            # Linux's uas driver refuses ATA pass-through for enclosures with known-broken
+            # bridges (all Seagate ones). Probing again cannot succeed, so stop here.
+            return [Check("smart", unknown, UAS_BLOCKED_HINT)], {}
         try:
             data = json.loads(p.stdout)
         except json.JSONDecodeError:

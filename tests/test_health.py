@@ -107,6 +107,28 @@ def test_unreadable_smart_uses_unknown_level(stderr: str, text: str) -> None:
     assert text in checks[0].detail
 
 
+def test_kernel_blocked_pass_through_is_reported_once_without_retry() -> None:
+    import json
+
+    blocked = json.dumps(
+        {
+            "smartctl": {
+                "messages": [
+                    {
+                        "string": "Read Device Identity failed: scsi error "
+                        "unsupported field in scsi command"
+                    }
+                ]
+            }
+        }
+    )
+    runner, calls = _runner([(4, blocked, "")])
+    checks, _ = smart_checks("/dev/sdz", runner, Level.WARN, None)
+    assert len(calls) == 1  # no second probe with -d sat
+    assert levels(checks) == [Level.WARN]
+    assert "uas driver" in checks[0].detail
+
+
 def test_kernel_log_ok_when_clean() -> None:
     journal = "sd 1:0:0:0: [sdz] Attached SCSI disk\nusb 3-2: new high-speed USB device"
     assert kernel_log_check("/dev/sdz", fake_runner(journal=journal)).level is Level.OK

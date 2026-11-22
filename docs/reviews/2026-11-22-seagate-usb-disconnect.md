@@ -28,12 +28,44 @@
 | `kernel-log` only looked after the *last* `Attached` line, so a drop-off + re-attach hid the errors. | Errors since the last attach FAIL; errors earlier in the same boot WARN ("dropped off USB?"). Regex also matches `device offline error` and `DID_NO_CONNECT`. Test replays the real log lines. |
 | Integration script printed "removed scratch folder … exists now: False" when the drive was gone. | It now checks the mount and says the folder was NOT removed. |
 
-## Root cause (not yet confirmed)
+## Root cause
 
 `sudo smartctl -a -d sat /dev/sda` on the idle, unmounted drive fails cleanly ("Read
 Device Identity failed: scsi error unsupported field in scsi command") **without** a
-disconnect, so the SMART probe alone does not reset the bridge. Leading hypothesis: the
-known instability of some Seagate UAS bridges under sustained load on Linux. Next steps:
-disable UAS for this device only (`usb-storage` quirk `0bc2:ab24:u`), clear the dirty flag
-(`chkdsk /f` on Windows, or `ntfsfix -d`), re-run the integration test with a 2 GiB file
-while watching `journalctl -k`. Research into SMART access for this bridge is ongoing.
+disconnect.
+
+Follow-up research (Claude Fable 5.1, web sources) explains why:
+
+- **SMART is blocked by the kernel, not the drive.** Since Linux 4.15 the `uas` driver sets
+  `US_FL_NO_ATA_1X` for *every* Seagate (VID `0x0bc2`) UAS enclosure ("All Seagate disk
+  enclosures have broken ATA pass-through support") and answers ATA_12/ATA_16 commands
+  locally with "invalid field in CDB". `-T permissive` and other `-d` types cannot help.
+  [commit 7fee72d5](https://github.com/torvalds/linux/commit/7fee72d5e8f1e7b8d8212e28291b1a0243ecf2f1),
+  [uas-detect.h](https://github.com/torvalds/linux/blob/master/drivers/usb/storage/uas-detect.h),
+  [Ubuntu bug 1810215](https://bugs.launchpad.net/ubuntu/+source/linux/+bug/1810215).
+- **So the gate's SMART probe never reached the bridge** and almost certainly did not cause
+  the disconnect. Seagate UAS enclosures resetting under sustained load is widely reported
+  (e.g. [Ubuntu bug 1584557](https://bugs.launchpad.net/ubuntu/+source/linux/+bug/1584557));
+  the standard mitigation is to disable UAS for the device. Not confirmed for this exact PID.
+- With UAS disabled (`usb-storage` quirk flag `u`), pass-through goes through the older
+  usb-storage (BOT) driver and `smartctl -d sat` works (smartmontools drivedb lists
+  `0bc2:ab24` "Seagate Backup Plus Slim" under `-d sat`). Cost: lower throughput.
+  Seagate's `openSeaChest` (Ubuntu package `openseachest`) hits the same kernel block
+  ([Seagate wiki](https://github.com/Seagate/openSeaChest/wiki/Enabling-Access-To-Additional-Commands-In-Linux)).
+
+**Tool change:** the gate recognises the "unsupported field in scsi command" response,
+reports SMART as *unknown* with this explanation, and does not retry with `-d sat`.
+
+## Operator fix for this drive
+
+```bash
+# disable UAS for this enclosure only (now, and on every boot)
+echo 0bc2:ab24:u | sudo tee /sys/module/usb_storage/parameters/quirks
+echo "options usb-storage quirks=0bc2:ab24:u" | sudo tee /etc/modprobe.d/seagate-bup-slim-no-uas.conf
+# replug the drive; `lsusb -t` should show Driver=usb-storage instead of uas
+# clear the dirty flag: chkdsk /f on Windows (preferred) or `sudo ntfsfix -d /dev/sdX1`
+sudo smartctl -a -d sat /dev/sdX          # SMART should now be readable
+```
+
+Then re-run `tests/integration/real_drive.py` with `--big-mb 2048` while watching
+`journalctl -kf` before trusting the drive with backups.
