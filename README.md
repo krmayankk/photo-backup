@@ -19,12 +19,14 @@ design.
 |---|---|
 | **Never overwrites** | A different file at the same path is kept side by side as `name.conflict-N.ext`. |
 | **Never deletes from a backup** | Deleting a photo on the phone never touches the drives. |
-| **Verify on write** | Hash while reading → write `.partial` → fsync → drop page cache → re-read and hash → rename. |
-| **Interrupt-safe** | Ctrl-C or unplugging leaves only `.partial` files; re-running resumes cleanly. |
+| **Verify on write** | Hash while reading → write `.pbtmp-<name>` → fsync → drop page cache → re-read and hash → rename. |
+| **Interrupt-safe** | Ctrl-C or unplugging leaves only `.pbtmp-*` temp files; re-running resumes cleanly. |
+| **Retries** | Transient read errors are retried twice; 10 failures in a row stop the run ("source disconnected"); a watchdog warns if no data moves for 3 minutes. |
 | **Read-only sources** | The iPhone is mounted `ifuse -o ro`. |
 | **Health gate** | SMART, kernel I/O errors, a write probe, free space, read-speed trend and a random re-hash of old backups — before anything is written. |
+| **Append-only records** | `manifest.tsv` and `SHA256SUMS` are only ever appended to. Their size and hash are sealed after each run; the gate and `verify` FAIL if either was edited, truncated or deleted. |
 | **Loud failure** | Any mismatch or count difference → exit 1 and `RESULT: FAIL`. |
-| **Two-copy rule** | `status` calls an item safe to delete only when ≥ 2 drives hold a verified copy. |
+| **Two-copy rule** | `status` calls an item safe to delete only when **every file of it** (photo, Live clip, edits) has an undamaged, verified copy on ≥ 2 different drives. A copy `verify` finds damaged stops counting and is re-copied by the next backup. |
 
 ## How a backup run flows
 
@@ -39,6 +41,23 @@ design.
    every copied file is re-checked on disk.
 5. **Record** — `summary.json`, `run.log` and a catalog snapshot per run; the catalog is
    mirrored to `~/.local/share/photo-backup/` so `status` works with drives unplugged.
+
+## What you see while it runs
+
+```
+kind       on source  already here  to copy  deferred
+photo           3605             0     3605         0
+video            196             0      196         0
+...
+health & sanity gate:
+  [OK  ] smart: passed; reallocated=0 pending=0 temp=34C power_on=1200h
+  [OK  ] kernel-log: no I/O errors for sdb since attach
+  ...
+ 41% ██████████░░░░░░░░░░░░░░ 14.2/34.3 GiB  7.1 MiB/s  ETA 47m10s  [2601/6239] IMG_1234.MOV
+```
+
+The bar is drawn only in an interactive terminal; `run.log` gets a progress line every
+100 files or 1 GiB, plus every retry, conflict and rename.
 
 ## Quick start
 
@@ -96,9 +115,10 @@ path on the phone.
 | `init <mount> --label L` | mark a drive | |
 | `drives` | attached drives, free space, last run | |
 | `health <drive>` | gate only + history | 0 ok · 2 fail |
-| `backup --from iphone\|dir:<path> --to <drive>` | `--dry-run`, `--limit N`, `--allow-unknown-health`, `--force-unhealthy`, `--sample-pct` | 0 pass · 1 verify fail · 2 gate fail |
-| `verify <drive>` | re-hash files vs catalog; `--device`, `--month`, `--sample-pct` | 0 pass · 1 damaged/missing |
-| `status` | copies per item, safe-to-delete verdicts, per-file TSV | |
+| `backup --from iphone\|dir:<path> --to <drive>` | `--dry-run`, `--limit N`, `--no-progress`, `--allow-unknown-health`, `--force-unhealthy`, `--sample-pct` | 0 pass · 1 verify fail · 2 gate fail |
+| `verify <drive>` | re-hash files vs catalog; `--device`, `--month`, `--sample-pct`, `--no-progress` | 0 pass · 1 damaged/missing |
+| `status` | copies per item, safe-to-delete verdicts, per-file TSV; `--min-copies` | |
+| `forget <label>` | stop counting a lost or wiped drive in `status` | |
 
 Usage errors (unknown drive, phone not connected) exit 3.
 
@@ -114,6 +134,10 @@ python -m venv .venv && .venv/bin/pip install -e '.[dev]'
 ```
 
 Python ≥ 3.10, standard library only. Linux.
+
+## Reviews
+
+Independent reviews and how each finding was resolved live in [docs/reviews/](docs/reviews/).
 
 ## Roadmap
 

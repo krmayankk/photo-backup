@@ -29,14 +29,17 @@ Runs on Linux. Python ≥ 3.10, standard library only.
    file gets a suffix (`IMG_1234.conflict-1.HEIC`); the conflict is logged.
 2. **Never delete from a backup** except via an explicit command that lists what would
    be removed and requires a typed confirmation (phase 2).
-3. **Verify on write.** Hash while reading the source → write `<name>.partial` → fsync →
-   re-read from the destination and hash → rename only if hashes match.
-4. **Interrupt-safe.** A crash/unplug leaves only `.partial` files; the next run removes
-   them and redoes the work. Re-running is always safe.
+3. **Verify on write.** Hash while reading the source → write `.pbtmp-<name>` (opened
+   exclusively, never truncating anything) → fsync → drop the page cache → re-read and
+   hash → rename only if hashes match. Dropping the cache is best-effort: on some FUSE
+   filesystems the re-read may still be served from memory.
+4. **Interrupt-safe.** A crash/unplug leaves only `.pbtmp-*` temp files; the next run
+   removes those the catalog does not know about and redoes the work.
 5. **Sources are read-only.** iPhone is mounted `-o ro`; Android is read via `adb exec-out cat`.
 6. **Loud failure.** Any mismatch, missing file or count difference → exit code 1 and a
    `FAIL` summary. Success is printed only when every check passed.
-7. **Safe-to-delete = verified copy on ≥ 2 distinct drives.**
+7. **Safe-to-delete = every file of the Photos item (photo, Live clip, edit sidecar,
+   rendered edit) has a verified, undamaged copy on ≥ 2 distinct drive labels.**
 
 ## Sources (device adapters)
 
@@ -51,8 +54,9 @@ Each source has a stable **device name** used in the layout:
 `--name` given for `dir:`. Model/OS version are recorded in every run summary.
 
 **Skip rule (re-runs):** a source file is skipped when this drive's catalog already has the
-same device + source path + size + mtime with a verified hash. `--rehash` re-reads and
-compares hashes instead (slow, paranoid).
+same device + source path + size + mtime **and that copy is not marked damaged**. Copies
+that `verify` or the gate's spot-check found damaged/missing are copied again.
+(Phase 2: `--rehash` to re-read and compare hashes of skipped files.)
 
 ## Drives
 
@@ -62,8 +66,8 @@ writes `PhotoBackup/.photo-backup/drive.json` (uuid, label, created). Commands a
 mountpoint path **or** the label (found by scanning `/media/$USER/*` and `/mnt/*`).
 
 Filesystem limits are enforced per file before copying: FAT32 4 GiB max file size;
-characters illegal on NTFS/exFAT/FAT (`<>:"\|?*`, trailing dot/space) are replaced and the
-mapping logged; case-only collisions on case-insensitive filesystems get a suffix.
+characters illegal on NTFS/exFAT/FAT (`<>:"\|?*`, trailing dot/space) are replaced, the
+rename is printed in `run.log` and kept in `manifest.tsv`; case-only collisions on case-insensitive filesystems get a suffix.
 
 ### Layout
 
@@ -105,7 +109,7 @@ FAIL → refuse to write (override `--force-unhealthy`, logged). WARN → contin
 | Kernel log | `journalctl -k` since boot, lines for this block device | I/O / medium errors | USB resets |
 | Writable | create + fsync + delete a probe file (catches dirty-NTFS read-only mounts) | not writable | — |
 | Free space | vs planned bytes | < planned × 1.1 | < 10 % free after run |
-| Read speed | read up to 256 MB of existing backup data | — | > 30 % below this drive's median |
+| Read speed | measured during the spot check (needs ≥ 64 MiB sampled) | — | > 30 % below this drive's median |
 | Spot check | re-hash a random sample of existing files (default 1 % capped at 2 GB) | any mismatch | — |
 | Catalog | `PRAGMA integrity_check` | not ok | — |
 
@@ -121,37 +125,44 @@ photo-backup init    <mountpoint> --label <name>
 photo-backup drives                                   # attached drives, label, free, last run
 photo-backup health  <drive>
 photo-backup backup  --from iphone|dir:<path> [--name N] --to <drive> [--dry-run] [--limit N]
-photo-backup verify  <drive> [--device D] [--run YYYY-MM] [--sample PCT]
+photo-backup verify  <drive> [--device D] [--month YYYY-MM] [--sample-pct PCT]
 photo-backup status  [--device D] [--min-copies 2]    # safe-to-delete report
+photo-backup forget  <label>                          # stop counting a lost/wiped drive
 ```
 
 Phase 2: Android adapter, `replicate --from <drive> --to <drive>`, `prune` (typed confirmation),
 `restore-test`, `rebuild-catalog` (from `manifest.tsv` files), iOS completeness check
 (compare `Photos.sqlite` asset count to `DCIM` to detect iCloud-only originals),
-`systemd-inhibit` wrapping, desktop notification.
+`systemd-inhibit` wrapping, desktop notification, `--rehash`.
 
 **Exit codes:** 0 pass · 1 verification/count failure · 2 preflight/gate failure · 3 usage.
 
 ### `backup` flow
 
-1. Resolve drive, take lock, run gate.
-2. Connect source, list files, classify, plan (skip / copy) → print counts and GB by kind.
-   `--dry-run` stops here.
-3. Copy with verify-on-write; record each file in the catalog as it lands (resumable).
-4. Reconcile: `listed = skipped + copied + conflicts + failed`, per kind; re-list the run's
-   `files/` from disk and compare with the manifest.
-5. Write manifest, SHA256SUMS, summary.json; mirror catalog; release lock; print PASS/FAIL.
+1. Resolve drive, take lock, connect source, list files, classify, plan (skip / copy /
+   re-copy damaged) → print counts and GB by kind.
+2. Run the gate with the planned byte count. `--dry-run` stops here.
+3. Copy with verify-on-write. Per file: append + fsync `manifest.tsv` and `SHA256SUMS`,
+   then commit the catalog row (resumable; see ordering note in `backup.py`).
+   Transient errors are retried twice (2 s, 5 s); 10 failed files in a row stop the run
+   ("source disconnected"). A watchdog warns when no bytes move for 3 minutes; a live
+   progress bar is shown when stderr is a terminal.
+4. Reconcile: `listed = skipped + deferred + copied + conflicts + duplicates + failed +
+   aborted`, per kind; every landed file is re-checked on disk at full size.
+5. Write summary.json and a catalog snapshot; mirror the catalog; print PASS/FAIL.
 
 ### `status` output
 
 ```
 iphone-iPhone15,4-5F6A   (last listed 2026-11-22)
-  kind        files      GB   on>=2 drives   safe to delete
-  video         165    20.3        165        YES (all)
-  photo       3,610     8.8      3,610        yes (optional)
-  live-clip   1,719     6.7      1,719        delete with its photo
-  drives: goflex (2026-11-22 PASS)  seagate-1tb (2026-11-23 PASS)
-  -> safe-to-delete-2026-11-23.tsv
+  kind       files      size  covered  on 0  verdict
+  photo       3605   8.8 GiB     3605     0  safe to delete (optional)
+  video        196  20.3 GiB      196     0  SAFE TO DELETE
+  live-clip   1694   6.7 GiB     1694     0  goes with its photo
+  covered = the whole item (photo + clip + edits) is on >= 2 drives
+  drive goflex-500: last run 20261122T140845 PASS
+  drive seagate-1tb: last run 20261123T101500 PASS
+  per-file report: ~/.local/share/photo-backup/reports/status-<device>-<date>.tsv
 ```
 
 ## Classification
