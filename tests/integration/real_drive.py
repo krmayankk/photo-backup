@@ -158,8 +158,13 @@ def main() -> int:
             if args.keep:
                 print(f"kept scratch folder: {scratch}")
             else:
-                shutil.rmtree(scratch, ignore_errors=True)
-                print(f"removed scratch folder: {scratch} (exists now: {scratch.exists()})")
+                if not os.path.ismount(args.mount):
+                    # The drive vanished (e.g. dropped off USB): "not exists" would be a lie.
+                    print(f"!! drive no longer mounted; scratch folder NOT removed: {scratch}")
+                else:
+                    shutil.rmtree(scratch, ignore_errors=True)
+                    state = "still exists!" if scratch.exists() else "removed"
+                    print(f"scratch folder {state}: {scratch}")
 
     print("\nINTEGRATION SUMMARY")
     for name, ok in results:

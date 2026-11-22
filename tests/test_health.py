@@ -107,19 +107,31 @@ def test_unreadable_smart_uses_unknown_level(stderr: str, text: str) -> None:
     assert text in checks[0].detail
 
 
-def test_kernel_errors_only_count_since_last_attach() -> None:
+def test_kernel_log_ok_when_clean() -> None:
+    journal = "sd 1:0:0:0: [sdz] Attached SCSI disk\nusb 3-2: new high-speed USB device"
+    assert kernel_log_check("/dev/sdz", fake_runner(journal=journal)).level is Level.OK
+
+
+def test_errors_before_a_reattach_still_warn() -> None:
+    # Real sequence from a USB drive that dropped off mid-write and re-enumerated.
     journal = "\n".join(
         [
-            "sd 1:0:0:0: [sdz] Attached SCSI disk",
-            "blk_update_request: I/O error, dev sdz, sector 42",
-            "sd 1:0:0:0: [sdz] Attached SCSI disk",
-            "usb 3-2: new high-speed USB device",
+            "sd 0:0:0:0: [sdz] Attached SCSI disk",
+            "sd 0:0:0:0: [sdz] tag#4 FAILED Result: hostbyte=DID_NO_CONNECT driverbyte=DRIVER_OK",
+            "I/O error, dev sdz, sector 8460640 op 0x1:(WRITE) flags 0x4800",
+            "usb 4-1: USB disconnect, device number 5",
+            "device offline error, dev sdz, sector 7799512 op 0x1:(WRITE)",
+            "sd 0:0:0:0: [sdz] Attached SCSI disk",
         ]
     )
     check = kernel_log_check("/dev/sdz", fake_runner(journal=journal))
-    assert check.level is Level.OK
-    bad = journal + "\nBuffer I/O error on dev sdz1, logical block 7"
-    assert kernel_log_check("/dev/sdz", fake_runner(journal=bad)).level is Level.FAIL
+    assert check.level is Level.WARN
+    assert "before it re-attached" in check.detail
+
+
+def test_errors_since_the_last_attach_fail() -> None:
+    journal = "sd 1:0:0:0: [sdz] Attached SCSI disk\nBuffer I/O error on dev sdz1, logical block 7"
+    assert kernel_log_check("/dev/sdz", fake_runner(journal=journal)).level is Level.FAIL
 
 
 def test_space_check_requires_margin(drive: Drive) -> None:

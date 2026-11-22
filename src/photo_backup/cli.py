@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import sqlite3
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -211,9 +212,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (DriveError, SourceError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_USAGE
-    except OSError as exc:  # e.g. drive unplugged mid-run, read-only mount
+    except (OSError, sqlite3.OperationalError) as exc:  # drive unplugged mid-run, read-only
         print(
-            f"I/O error: {exc}\nverified files are kept; fix the cause and re-run", file=sys.stderr
+            f"drive I/O error: {exc}\n"
+            "Was the drive unplugged or did it drop off USB? Check `journalctl -k`. "
+            "Verified files are kept; reconnect (check the filesystem if it is now marked "
+            "dirty) and re-run.",
+            file=sys.stderr,
         )
         return EXIT_VERIFY_FAILED
     except KeyboardInterrupt:

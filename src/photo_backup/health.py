@@ -39,7 +39,8 @@ FREE_MARGIN = 1.1
 SMARTCTL_HINT = "install smartmontools and allow passwordless smartctl (see README, 'Drive health')"
 
 _KERNEL_ERROR_RE = re.compile(
-    r"I/O error|Medium Error|Unrecovered read error|critical medium error|Buffer I/O error",
+    r"I/O error|Medium Error|Unrecovered read error|critical medium error|Buffer I/O error"
+    r"|device offline error|DID_NO_CONNECT",
     re.IGNORECASE,
 )
 
@@ -179,7 +180,12 @@ def smart_checks(
 
 
 def kernel_log_check(disk: str | None, runner: Runner) -> Check:
-    """Look for I/O errors logged for this disk since it was last attached."""
+    """Look for I/O errors logged for this disk during this boot.
+
+    Errors since the disk was last attached FAIL. Errors from *before* the last attach
+    WARN: a USB drive that dropped off mid-write and re-enumerated gets a fresh
+    "Attached" line, which must not hide that its filesystem may now need a check.
+    """
     if disk is None:
         return Check("kernel-log", Level.SKIP, "no block device")
     p = runner(["journalctl", "-k", "-b", "--no-pager", "-o", "cat"])
@@ -188,11 +194,19 @@ def kernel_log_check(disk: str | None, runner: Runner) -> Check:
     name = Path(disk).name
     lines = p.stdout.splitlines()
     attached = [i for i, line in enumerate(lines) if f"[{name}] Attached" in line]
-    since = lines[attached[-1] :] if attached else lines
-    errors = [ln for ln in since if name in ln and _KERNEL_ERROR_RE.search(ln)]
+    cut = attached[-1] if attached else 0
+    errors = [ln for ln in lines if name in ln and _KERNEL_ERROR_RE.search(ln)]
+    recent = [ln for ln in lines[cut:] if name in ln and _KERNEL_ERROR_RE.search(ln)]
+    if recent:
+        return Check("kernel-log", Level.FAIL, f"{len(recent)} I/O errors, last: {recent[-1]}")
     if errors:
-        return Check("kernel-log", Level.FAIL, f"{len(errors)} I/O errors, last: {errors[-1]}")
-    return Check("kernel-log", Level.OK, f"no I/O errors for {name} since attach")
+        return Check(
+            "kernel-log",
+            Level.WARN,
+            f"{len(errors)} I/O errors for {name} earlier this boot, before it re-attached "
+            f"(dropped off USB?); last: {errors[-1]}",
+        )
+    return Check("kernel-log", Level.OK, f"no I/O errors for {name} this boot")
 
 
 def writable_check(drive: Drive) -> Check:
