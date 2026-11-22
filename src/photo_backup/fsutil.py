@@ -64,6 +64,18 @@ def hash_file(path: Path) -> tuple[str, int]:
     return h.hexdigest(), n
 
 
+def hash_prefix(path: Path, length: int) -> str:
+    """SHA-256 of the first ``length`` bytes of ``path`` (from the device)."""
+    h = hashlib.sha256()
+    remaining = length
+    with open(path, "rb") as fh:
+        drop_page_cache(fh.fileno())
+        while remaining > 0 and (chunk := fh.read(min(CHUNK, remaining))):
+            h.update(chunk)
+            remaining -= len(chunk)
+    return h.hexdigest()
+
+
 def fsync_dir(path: Path) -> None:
     """Persist a directory entry (rename/create) to disk."""
     try:
@@ -78,20 +90,49 @@ def fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
-def free_name(directory: Path, name: str) -> Path:
-    """Return ``directory/name`` or a ``.conflict-N`` variant that is not taken.
+class NameIndex:
+    """Case-insensitive view of directory contents, listed once per directory.
 
-    The comparison is case-insensitive so the result is also safe on NTFS/exFAT when the
-    drive is later used from Windows or macOS.
+    Case-insensitive so results are also right on NTFS/exFAT and when the drive is later
+    used from Windows or macOS. The index must be told about files the caller creates or
+    removes (``add`` / ``discard``).
     """
-    taken = {n.lower() for n in os.listdir(directory)} if directory.is_dir() else set()
-    if name.lower() not in taken:
-        return directory / name
-    root, ext = posixpath.splitext(name)
-    i = 1
-    while f"{root}.conflict-{i}{ext}".lower() in taken:
-        i += 1
-    return directory / f"{root}.conflict-{i}{ext}"
+
+    def __init__(self) -> None:
+        self._dirs: dict[Path, dict[str, str]] = {}
+
+    def _names(self, directory: Path) -> dict[str, str]:
+        if directory not in self._dirs:
+            names = os.listdir(directory) if directory.is_dir() else []
+            self._dirs[directory] = {n.lower(): n for n in names}
+        return self._dirs[directory]
+
+    def existing(self, directory: Path, name: str) -> Path | None:
+        """The entry whose name equals ``name`` ignoring case, with its real on-disk case."""
+        actual = self._names(directory).get(name.lower())
+        return directory / actual if actual is not None else None
+
+    def free(self, directory: Path, name: str) -> Path:
+        """``directory/name`` or the first free ``root.conflict-N.ext`` variant."""
+        taken = self._names(directory)
+        if name.lower() not in taken:
+            return directory / name
+        root, ext = posixpath.splitext(name)
+        i = 1
+        while f"{root}.conflict-{i}{ext}".lower() in taken:
+            i += 1
+        return directory / f"{root}.conflict-{i}{ext}"
+
+    def add(self, path: Path) -> None:
+        self._names(path.parent)[path.name.lower()] = path.name
+
+    def discard(self, path: Path) -> None:
+        self._names(path.parent).pop(path.name.lower(), None)
+
+
+def free_name(directory: Path, name: str) -> Path:
+    """One-off form of :meth:`NameIndex.free`."""
+    return NameIndex().free(directory, name)
 
 
 def fs_type(path: Path) -> str | None:

@@ -31,33 +31,65 @@ class MirroredDrive:
     uuid: str
     label: str
     catalog_path: Path
+    last_seen: datetime
+
+
+def _index_path() -> Path:
+    return state_dir() / "drives.json"
+
+
+def _load_index() -> dict[str, dict[str, str]]:
+    path = _index_path()
+    return json.loads(path.read_text()) if path.is_file() else {}
+
+
+def _save_index(index: dict[str, dict[str, str]]) -> None:
+    _index_path().parent.mkdir(parents=True, exist_ok=True)
+    _index_path().write_text(json.dumps(index, indent=2) + "\n")
 
 
 def mirror_catalog(drive: Drive, catalog: Catalog) -> Path:
     dest = state_dir() / "drives" / f"{drive.uuid}.sqlite"
     catalog.snapshot_to(dest)
-    index_path = state_dir() / "drives.json"
-    index = json.loads(index_path.read_text()) if index_path.is_file() else {}
+    index = _load_index()
     index[drive.uuid] = {
         "label": drive.label,
         "last_mount": str(drive.mount),
         "last_seen": datetime.now().isoformat(timespec="seconds"),
     }
-    index_path.write_text(json.dumps(index, indent=2) + "\n")
+    _save_index(index)
     return dest
 
 
 def mirrored_drives() -> list[MirroredDrive]:
-    index_path = state_dir() / "drives.json"
-    if not index_path.is_file():
-        return []
-    index = json.loads(index_path.read_text())
-    out = []
-    for drive_uuid, info in sorted(index.items(), key=lambda kv: kv[1]["label"]):
+    """One entry per drive label: the most recently seen mirror wins.
+
+    A drive that was reformatted and re-initialised gets a new uuid but usually the same
+    label; counting both mirrors would make one physical drive look like two copies.
+    """
+    latest: dict[str, MirroredDrive] = {}
+    for drive_uuid, info in _load_index().items():
         path = state_dir() / "drives" / f"{drive_uuid}.sqlite"
-        if path.is_file():
-            out.append(MirroredDrive(drive_uuid, info["label"], path))
-    return out
+        if not path.is_file():
+            continue
+        entry = MirroredDrive(
+            drive_uuid, info["label"], path, datetime.fromisoformat(info["last_seen"])
+        )
+        current = latest.get(entry.label)
+        if current is None or entry.last_seen > current.last_seen:
+            latest[entry.label] = entry
+    return sorted(latest.values(), key=lambda d: d.label)
+
+
+def forget_drive(label: str) -> int:
+    """Drop every mirror for ``label`` (lost, dead or wiped drive). Returns how many."""
+    index = _load_index()
+    gone = [u for u, info in index.items() if info["label"] == label]
+    for drive_uuid in gone:
+        del index[drive_uuid]
+        (state_dir() / "drives" / f"{drive_uuid}.sqlite").unlink(missing_ok=True)
+    _save_index(index)
+    return len(gone)
 
 
 @dataclass(frozen=True)

@@ -50,3 +50,20 @@ def classify(paths: Iterable[str]) -> dict[str, Kind]:
         else:
             kinds[p] = Kind.OTHER
     return kinds
+
+
+def asset_key(path: str) -> tuple[str, str]:
+    """Identify the Photos-app item a file belongs to, as ``(folder, lowercase stem)``.
+
+    ``DCIM/100APPLE/IMG_1.HEIC``, ``IMG_1.MOV`` (Live clip), ``IMG_1.AAE`` (edit sidecar)
+    and the rendered edit ``PhotoData/Mutations/DCIM/100APPLE/IMG_1/Adjustments/
+    FullSizeRender.jpg`` all share the key ``("DCIM/100APPLE", "img_1")``. Deleting the
+    item in the Photos app deletes all of them, so they are only safe to delete together.
+    """
+    if path.startswith(EDITED_PREFIX):
+        parts = path[len(EDITED_PREFIX) :].split("/")
+        if "Adjustments" in parts:
+            folder, stem = posixpath.split("/".join(parts[: parts.index("Adjustments")]))
+            return folder, stem.lower()
+    folder, stem, _ = _split(path)
+    return folder, stem

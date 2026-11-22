@@ -21,9 +21,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from photo_backup.catalog import Catalog
+from photo_backup.catalog import Catalog, FileRow
 from photo_backup.drive import Drive
-from photo_backup.fsutil import hash_file
+from photo_backup.fsutil import hash_file, hash_prefix
 from photo_backup.model import Check, Level
 from photo_backup.proc import Runner, run
 
@@ -38,8 +38,16 @@ FREE_MARGIN = 1.1
 
 SMARTCTL_HINT = "install smartmontools and allow passwordless smartctl (see README, 'Drive health')"
 
+_KERNEL_BLOCKS_SAT = "unsupported field in scsi command"
+UAS_BLOCKED_HINT = (
+    "SMART blocked by the Linux uas driver for this USB enclosure (NO_ATA_1X quirk, applied "
+    "to all Seagate enclosures). To read SMART, disable UAS for this device: "
+    "usb-storage quirk VID:PID:u (see docs/reviews/2026-11-22-seagate-usb-disconnect.md)"
+)
+
 _KERNEL_ERROR_RE = re.compile(
-    r"I/O error|Medium Error|Unrecovered read error|critical medium error|Buffer I/O error",
+    r"I/O error|Medium Error|Unrecovered read error|critical medium error|Buffer I/O error"
+    r"|device offline error|DID_NO_CONNECT",
     re.IGNORECASE,
 )
 
@@ -166,6 +174,10 @@ def smart_checks(
             return [Check("smart", unknown, f"smartctl not installed; {SMARTCTL_HINT}")], {}
         if "password is required" in p.stderr or "terminal is required" in p.stderr:
             return [Check("smart", unknown, f"no sudo rule for smartctl; {SMARTCTL_HINT}")], {}
+        if _KERNEL_BLOCKS_SAT in (p.stdout + p.stderr).lower():
+            # Linux's uas driver refuses ATA pass-through for enclosures with known-broken
+            # bridges (all Seagate ones). Probing again cannot succeed, so stop here.
+            return [Check("smart", unknown, UAS_BLOCKED_HINT)], {}
         try:
             data = json.loads(p.stdout)
         except json.JSONDecodeError:
@@ -179,7 +191,12 @@ def smart_checks(
 
 
 def kernel_log_check(disk: str | None, runner: Runner) -> Check:
-    """Look for I/O errors logged for this disk since it was last attached."""
+    """Look for I/O errors logged for this disk during this boot.
+
+    Errors since the disk was last attached FAIL. Errors from *before* the last attach
+    WARN: a USB drive that dropped off mid-write and re-enumerated gets a fresh
+    "Attached" line, which must not hide that its filesystem may now need a check.
+    """
     if disk is None:
         return Check("kernel-log", Level.SKIP, "no block device")
     p = runner(["journalctl", "-k", "-b", "--no-pager", "-o", "cat"])
@@ -188,11 +205,19 @@ def kernel_log_check(disk: str | None, runner: Runner) -> Check:
     name = Path(disk).name
     lines = p.stdout.splitlines()
     attached = [i for i, line in enumerate(lines) if f"[{name}] Attached" in line]
-    since = lines[attached[-1] :] if attached else lines
-    errors = [ln for ln in since if name in ln and _KERNEL_ERROR_RE.search(ln)]
+    cut = attached[-1] if attached else 0
+    errors = [ln for ln in lines if name in ln and _KERNEL_ERROR_RE.search(ln)]
+    recent = [ln for ln in lines[cut:] if name in ln and _KERNEL_ERROR_RE.search(ln)]
+    if recent:
+        return Check("kernel-log", Level.FAIL, f"{len(recent)} I/O errors, last: {recent[-1]}")
     if errors:
-        return Check("kernel-log", Level.FAIL, f"{len(errors)} I/O errors, last: {errors[-1]}")
-    return Check("kernel-log", Level.OK, f"no I/O errors for {name} since attach")
+        return Check(
+            "kernel-log",
+            Level.WARN,
+            f"{len(errors)} I/O errors for {name} earlier this boot, before it re-attached "
+            f"(dropped off USB?); last: {errors[-1]}",
+        )
+    return Check("kernel-log", Level.OK, f"no I/O errors for {name} this boot")
 
 
 def writable_check(drive: Drive) -> Check:
@@ -244,11 +269,14 @@ def space_checks(drive: Drive, planned_bytes: int | None) -> list[Check]:
 
 def sample_check(
     drive: Drive, catalog: Catalog, pct: float, cap_bytes: int, rng: random.Random
-) -> tuple[Check, dict[str, Any]]:
-    """Re-hash a random sample of already-backed-up files; also measures read speed."""
-    rows = list(catalog.files())
+) -> tuple[Check, dict[str, Any], list[FileRow]]:
+    """Re-hash a random sample of good backed-up files; also measures read speed.
+
+    Returns the check, metrics, and the rows found damaged or missing.
+    """
+    rows = [r for r in catalog.files() if r.is_good]
     if not rows:
-        return Check("spot-check", Level.SKIP, "nothing backed up yet"), {}
+        return Check("spot-check", Level.SKIP, "nothing backed up yet"), {}, []
     rng.shuffle(rows)
     want = max(1, round(len(rows) * pct / 100))
     sample, total = [], 0
@@ -258,30 +286,26 @@ def sample_check(
         sample.append(row)
         total += row.size
 
-    bad: list[str] = []
+    bad: list[FileRow] = []
     start = time.monotonic()
     for row in sample:
-        path = drive.root / row.dest_path
         try:
-            digest, _ = hash_file(path)
-        except OSError as exc:
-            bad.append(f"{row.dest_path} ({exc.strerror})")
+            digest, _ = hash_file(drive.root / row.dest_path)
+        except OSError:
+            bad.append(row)
             continue
         if digest != row.sha256:
-            bad.append(row.dest_path)
+            bad.append(row)
     elapsed = time.monotonic() - start
     metrics: dict[str, Any] = {"sample_files": len(sample), "sample_bad": len(bad)}
     if total >= SPEED_MIN_SAMPLE_BYTES and elapsed > 0:
         metrics["read_mb_s"] = round(total / MIB / elapsed, 1)
     if bad:
-        return (
-            Check("spot-check", Level.FAIL, f"{len(bad)}/{len(sample)} files damaged: {bad[:3]}"),
-            metrics,
-        )
-    return (
-        Check("spot-check", Level.OK, f"{len(sample)} files ({total / MIB:.0f} MiB) re-hashed ok"),
-        metrics,
-    )
+        names = [r.dest_path for r in bad[:3]]
+        detail = f"{len(bad)}/{len(sample)} files damaged or missing: {names}; run verify"
+        return Check("spot-check", Level.FAIL, detail), metrics, bad
+    detail = f"{len(sample)} files ({total / MIB:.0f} MiB) re-hashed ok"
+    return Check("spot-check", Level.OK, detail), metrics, []
 
 
 def speed_check(speed: float | None, history: list[float]) -> Check:
@@ -295,6 +319,26 @@ def speed_check(speed: float | None, history: list[float]) -> Check:
             "read-speed", Level.WARN, f"{speed} MB/s vs usual {median:.1f} MB/s: drive slowing?"
         )
     return Check("read-speed", Level.OK, f"{speed} MB/s (usual {median:.1f})")
+
+
+def records_check(drive: Drive, catalog: Catalog) -> Check:
+    """manifest.tsv / SHA256SUMS must be append-only: each must still start with exactly
+    the bytes recorded at the end of the last run that wrote it."""
+    records = catalog.records()
+    if not records:
+        return Check("records", Level.SKIP, "no record files yet")
+    broken = []
+    for rel, size, sha in records:
+        path = drive.root / rel
+        if not path.is_file():
+            broken.append(f"{rel} missing")
+        elif path.stat().st_size < size:
+            broken.append(f"{rel} shrank")
+        elif hash_prefix(path, size) != sha:
+            broken.append(f"{rel} modified in place")
+    if broken:
+        return Check("records", Level.FAIL, "append-only records changed: " + "; ".join(broken))
+    return Check("records", Level.OK, f"{len(records)} manifest/checksum files intact")
 
 
 def catalog_check(catalog: Catalog) -> Check:
@@ -356,14 +400,17 @@ def run_gate(
     checks.append(kernel_log_check(disk, runner))
     checks.append(writable_check(drive))
     checks.extend(space_checks(drive, planned_bytes))
-    sample, sample_metrics = sample_check(
+    sample, sample_metrics, damaged = sample_check(
         drive, catalog, opts.sample_pct, opts.sample_cap_bytes, random.Random(opts.seed)
     )
+    if damaged and opts.record:
+        catalog.mark_damaged(damaged)  # status must stop counting these copies
     checks.append(sample)
     metrics.update(sample_metrics)
     speeds = [float(r["read_mb_s"]) for r in history if r.get("read_mb_s", "").strip()]
     checks.append(speed_check(metrics.get("read_mb_s"), speeds))
     checks.append(catalog_check(catalog))
+    checks.append(records_check(drive, catalog))
 
     result = GateResult(checks, metrics, forced=opts.force_unhealthy)
     if opts.record:

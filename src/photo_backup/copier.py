@@ -5,12 +5,15 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import os
+from collections.abc import Collection
 from pathlib import Path
 from typing import BinaryIO
 
 from photo_backup.fsutil import CHUNK, fsync_dir, hash_file
 
-PARTIAL_SUFFIX = ".partial"
+#: Prefix of in-flight temp files. Hidden and tool-specific so it cannot be mistaken for
+#: (or collide with) a real backed-up file such as ``movie.mp4.partial``.
+TMP_PREFIX = ".pbtmp-"
 
 
 class CopyError(Exception):
@@ -22,7 +25,7 @@ def copy_verified(
 ) -> tuple[str, int]:
     """Copy ``src`` to ``dest`` and prove the bytes on disk match what was read.
 
-    Steps: hash while streaming into ``dest.partial`` -> fsync -> drop page cache ->
+    Steps: hash while streaming into ``.pbtmp-<name>`` -> fsync -> drop page cache ->
     re-read and hash -> rename to ``dest``. ``dest`` must not exist; it is never
     overwritten. On any failure the partial file is removed and :class:`CopyError`
     (or the original exception) propagates.
@@ -32,12 +35,16 @@ def copy_verified(
     if dest.exists():
         raise CopyError(f"refusing to overwrite existing file: {dest}")
     dest.parent.mkdir(parents=True, exist_ok=True)
-    partial = dest.with_name(dest.name + PARTIAL_SUFFIX)
+    partial = dest.with_name(TMP_PREFIX + dest.name)
+    try:
+        out = open(partial, "xb")  # noqa: SIM115 - "x": never truncate an existing file
+    except FileExistsError as exc:
+        raise CopyError(f"temp file already exists, refusing to touch it: {partial}") from exc
 
     try:
         h = hashlib.sha256()
         size = 0
-        with open(partial, "wb") as out:
+        with out:
             while chunk := src.read(CHUNK):
                 h.update(chunk)
                 out.write(chunk)
@@ -67,13 +74,18 @@ def copy_verified(
         raise
 
 
-def remove_stale_partials(root: Path) -> int:
-    """Delete ``*.partial`` leftovers from an interrupted run. Returns how many."""
+def remove_stale_partials(root: Path, keep: Collection[Path] = ()) -> int:
+    """Delete temp files left by an interrupted run. Returns how many.
+
+    Anything listed in ``keep`` (every path the catalog knows) is never deleted, even if
+    its name happens to look like a temp file.
+    """
     if not root.is_dir():
         return 0
+    protected = set(keep)
     count = 0
-    for p in root.rglob("*" + PARTIAL_SUFFIX):
-        if p.is_file():
+    for p in root.rglob(TMP_PREFIX + "*"):
+        if p.is_file() and p not in protected:
             p.unlink()
             count += 1
     return count

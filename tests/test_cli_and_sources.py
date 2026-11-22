@@ -63,6 +63,24 @@ def test_cli_backup_verify_status_roundtrip(
     assert "SAFE TO DELETE" in out
 
 
+def test_cli_turns_a_vanished_drive_into_a_clean_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    import sqlite3
+
+    mount = tmp_path / "drive"
+    mount.mkdir()
+    init_drive(mount, "gone", require_mountpoint=False)
+
+    def explode(*_a: object, **_k: object) -> int:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(cli, "run_verify", explode)
+    assert cli.main(["verify", str(mount)]) == 1
+    err = capsys.readouterr().err
+    assert "drive I/O error" in err and "Traceback" not in err
+
+
 def test_cli_reports_unknown_drive(capsys) -> None:
     assert cli.main(["verify", "no-such-label"]) == EXIT_USAGE
     assert "no attached drive" in capsys.readouterr().err
